@@ -1,0 +1,24 @@
+# Lokale Projektdateien (nur für mich)
+PROJEKT.txt
+TODO.txt
+LOG.txt
+projekt.json
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+# Editor / System
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+# Große oder private Daten
+data/raw/
+data/private/
+*.pt
+*.onnx
+*.tflite
+*.h5
