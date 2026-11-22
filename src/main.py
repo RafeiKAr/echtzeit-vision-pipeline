@@ -7,9 +7,6 @@ import mediapipe as mp
 
 
 
-
-
-
 def main() -> None:
     print("Echtzeit-Vision-Pipeline läuft.")
 
