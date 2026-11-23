@@ -1,5 +1,6 @@
 """Echtzeit-Vision-Pipeline – Einstiegspunkt."""
 
+
 import argparse                             # argparse liest Optionen ein, die beim Start des Programms angegeben werden.
 
 from collections import deque               # deque speichert die Bildzeitpunkte fuer die laufende FPS-Anzeige.
@@ -14,12 +15,18 @@ import mediapipe as mp                      # MediaPipe stellt den Gesichtserken
 
 
 
-RESOLUTIONS = ((1280, 720), (640, 480), (320, 240))                                                 # RESOLUTIONS enthaelt die drei fuer den Vergleich geforderten Bildgroessen.
+RESOLUTIONS = ((1280, 720), (640, 480), (320, 240))                                                  # RESOLUTIONS enthaelt die drei fuer den Vergleich geforderten Bildgroessen.
 
 MEASUREMENTS_PER_RESOLUTION = 3                                                                     # MEASUREMENTS_PER_RESOLUTION legt drei Messlaeufe pro Bildgroesse fest.
 
 REPORT_PATH = Path(__file__).resolve().parent.parent / "results" / "messung.md"                     # REPORT_PATH ist der Speicherort des automatisch erstellten Messberichts.
 
+# Globale Latenzwerte
+LATENZ = {
+    "read": 0.0,
+    "convert": 0.0,
+    "detect": 0.0
+}
 
 # Measurement speichert die Messwerte eines einzelnen 30-Sekunden-Laufs.
 @dataclass
@@ -44,7 +51,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     
     # --camera waehlt die Kamera aus; standardmaessig wird Kamera 0 verwendet.
-    parser.add_argument("--camera", type=int, default=0, help="Kamera-Index (Standard: 0)")
+    parser.add_argument("--camera", "--kamera", type=int, dest="camera", default=0, help="Kamera-Index (Standard: 0)")
     
     # --confidence legt die minimale Erkennungssicherheit von 0 bis 1 fest.
     parser.add_argument(
@@ -56,15 +63,17 @@ def parse_arguments() -> argparse.Namespace:
     
     # --width fordert im normalen Kameramodus eine bestimmte Bildbreite an.
     parser.add_argument(
-        "--width",
+        "--width", "--breite",
         type=int,
+        dest="width",
         help="Angeforderte Kamera-Bildbreite fuer den normalen Modus",
     )
     
     # --height fordert im normalen Kameramodus eine bestimmte Bildhoehe an.
     parser.add_argument(
-        "--height",
+        "--height", "--hoehe",
         type=int,
+        dest="height",
         help="Angeforderte Kamera-Bildhoehe fuer den normalen Modus",
     )
     
@@ -92,8 +101,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     
 
-    # args enthaelt die von argparse gelesenen Kommandozeilenwerte.
-    args = parser.parse_args()
+    args = parser.parse_args()                                                      # args enthaelt die von argparse gelesenen Kommandozeilenwerte.
 
     # Eine Confidence ausserhalb des erlaubten Bereichs ist ein Eingabefehler.
     if not 0 <= args.confidence <= 1:
@@ -124,8 +132,7 @@ def parse_arguments() -> argparse.Namespace:
     if args.warmup < 0:
         parser.error("--warmup darf nicht negativ sein.")
 
-    # Gibt die geprueften Programmoptionen zurueck.
-    return args
+    return args                                                                         # Gibt die geprueften Programmoptionen zurueck.
 
 
 # open_camera oeffnet die Kamera und fordert optional die gewuenschte Bildgroesse an.
@@ -145,15 +152,28 @@ def open_camera(
 
 
     # Fordert nur dann eine Bildbreite an, wenn eine angegeben wurde.
-    if width is not None:
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if width is not None and height is not None:
+        set_camera_resolution(camera, width, height)
     
-    # Fordert nur dann eine Bildhoehe an, wenn eine angegeben wurde.
-    if height is not None:
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return camera                                                                       # Gibt die geoeffnete Kamera zurueck.
 
-    # Gibt die geoeffnete Kamera zurueck.
-    return camera
+
+# set_camera_resolution fordert eine Bildgroesse an und meldet abgelehnte Einstellungen.
+def set_camera_resolution(camera: cv2.VideoCapture, width: int, height: int) -> None:
+    
+    width_accepted = camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)                        # OpenCV meldet mit dem Rueckgabewert, ob es die angeforderte Breite uebernommen hat.
+    
+    height_accepted = camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)                     # OpenCV meldet mit dem Rueckgabewert, ob es die angeforderte Hoehe uebernommen hat.
+
+
+    # Eine abgelehnte Breite wird als Warnung gemeldet; das tatsaechliche Frame wird spaeter geprueft.
+    if not width_accepted:
+        print(f"Warnung: Kamera hat die angeforderte Breite {width} nicht bestaetigt.")
+    
+
+    # Eine abgelehnte Hoehe wird als Warnung gemeldet; das tatsaechliche Frame wird spaeter geprueft.
+    if not height_accepted:
+        print(f"Warnung: Kamera hat die angeforderte Hoehe {height} nicht bestaetigt.")
 
 
 # read_and_detect liest ein Kamerabild, erkennt Gesichter und zeichnet die Rahmen.
@@ -162,25 +182,39 @@ def read_and_detect(
     detector: mp.solutions.face_detection.FaceDetection,
 ) -> tuple[object, float, int]:
     
-    started = time.perf_counter()                                                       # started erfasst den Anfang der Latenzmessung vor dem Kamera-Read.
+    # Zeit für das Einlesen des Kamerabildes
+    read_start = time.perf_counter()                                                       # read_start erfasst den Anfang der Latenzmessung vor dem Kamera-Read.
     success, frame = camera.read()                                                      # camera.read liest das naechste Bild und meldet, ob das Lesen erfolgreich war.
+    read_ms = (time.perf_counter() - read_start) * 1000
     
 
     # Ein fehlgeschlagener Lesevorgang wird explizit als Fehler gemeldet.
     if not success:
         raise RuntimeError("Es konnte kein Kamerabild gelesen werden.")
 
-    
+
+    # Zeit für die Farbkonvertierung
+    convert_start = time.perf_counter()
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)                                  # MediaPipe erwartet RGB statt der von OpenCV verwendeten BGR-Farbkanaele.
-    
+    convert_ms = (time.perf_counter() - convert_start) * 1000
+
+
+    # Zeit für die Gesichtserkennung
+    detect_start = time.perf_counter()
     rgb_frame.flags.writeable = False                                                   # Das Eingabebild wird schreibgeschuetzt, was die Verarbeitung beschleunigen kann.
-    
     results = detector.process(rgb_frame)                                               # detector.process fuehrt die Gesichtserkennung auf dem RGB-Bild aus.
+    detect_ms = (time.perf_counter() - detect_start) * 1000    
+
+
+    # Gesamtlatenz
+    latency_ms = read_ms + convert_ms + detect_ms                                # latency_ms umfasst Kamera-Read, Farbkonvertierung und Gesichtserkennung.
     
-    latency_ms = (time.perf_counter() - started) * 1000                                 # latency_ms umfasst Kamera-Read, Farbkonvertierung und Gesichtserkennung.
-    
+    LATENZ["read"] = read_ms
+    LATENZ["convert"] = convert_ms
+    LATENZ["detect"] = detect_ms
+
+
     frame_height, frame_width = frame.shape[:2]                                         # frame_height und frame_width enthalten die Bildabmessungen in Pixeln.
-    
     detections = results.detections or []                                               # detections wird auch dann eine Liste, wenn MediaPipe nichts erkennt.
 
     # Diese Schleife zeichnet fuer jedes erkannte Gesicht Rahmen und Confidence.
@@ -197,7 +231,7 @@ def read_and_detect(
         height = min(frame_height - y, int(bounding_box.height * frame_height))
         
         cv2.rectangle(frame, (x, y), (x + width, y + height), (255, 0, 0), 2)           # rectangle zeichnet einen blauen Rahmen um das erkannte Gesicht.
-        
+
         confidence = detection.score[0]                                                 # confidence enthaelt den Sicherheitswert fuer diese Gesichtserkennung.
 
 
@@ -287,6 +321,7 @@ def run_live(args: argparse.Namespace, detector: mp.solutions.face_detection.Fac
     frame_times: deque[float] = deque()                                                 # frame_times enthaelt die Zeitpunkte der Bilder im gleitenden Ein-Sekunden-Fenster.
     fps = 0.0                                                                           # fps wird bis zur ersten gueltigen Messung mit null angezeigt.    
     last_fps_update = 0.0                                                               # last_fps_update verhindert eine Neuberechnung bei jedem einzelnen Bild.
+    display_latency_ms = 0.0                                                            # display_latency_ms zeigt die End-to-End-Latenz des vorherigen Bildes an.
 
     # try/finally gibt Kamera und Fenster auch bei Fehlern frei.
     try:
@@ -296,7 +331,7 @@ def run_live(args: argparse.Namespace, detector: mp.solutions.face_detection.Fac
 
         # Die Schleife liest und verarbeitet Bilder bis zum Beenden.
         while True:
-            frame_start = time.perf_counter()                                           # frame_start startet die FPS-Zeitmessung fuer dieses Bild.
+            frame_start = time.perf_counter()                                           # frame_start startet die FPS- und End-to-End-Latenzmessung fuer dieses Bild.
             frame, latency_ms, face_count = read_and_detect(camera, detector)           # read_and_detect liest das Bild, erkennt Gesichter und misst die Latenz.
             frame_height, frame_width = frame.shape[:2]                                 # frame_height und frame_width geben die tatsaechliche Kameraaufloesung an.
 
@@ -329,7 +364,8 @@ def run_live(args: argparse.Namespace, detector: mp.solutions.face_detection.Fac
                 
                 last_fps_update = frame_start                                           # Merkt sich den Zeitpunkt der letzten FPS-Berechnung.
             
-            key = show_frame(frame, fps, latency_ms, face_count)                        # show_frame zeichnet die Werte und wartet auf eine Tasteneingabe.
+            key = show_frame(frame, fps, display_latency_ms, face_count)                # show_frame zeigt die End-to-End-Latenz des vorherigen Bildes.
+            display_latency_ms = (time.perf_counter() - frame_start) * 1000             # display_latency_ms umfasst Kamera, Erkennung, Zeichnen und Fensteraktualisierung.
             
 
             # q oder Esc beendet den normalen Kameramodus.
@@ -343,6 +379,10 @@ def run_live(args: argparse.Namespace, detector: mp.solutions.face_detection.Fac
         camera.release()                                                                # release schliesst die Kamera und gibt ihre Systemressourcen frei.
         cv2.destroyAllWindows()                                                         # destroyAllWindows schliesst alle von OpenCV geoeffneten Fenstern.
 
+    # Ergebnisse ausgeben
+    print('\n\n',15*'==')
+    print_latenz(args.width, args.height, LATENZ)
+    print('',15*'==', '\n\n')
 
 # run_measurement fuehrt Aufwaermzeit und einen zeitlich begrenzten Messlauf aus.
 def run_measurement(
@@ -356,8 +396,7 @@ def run_measurement(
 ) -> Measurement | None:
 
     # Fordert vor jedem Lauf die aktuelle gewuenschte Kameraaufloesung an.
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_height)
+    set_camera_resolution(camera, requested_width, requested_height)
     
     # Meldet, welche Aufloesung und welcher Wiederholungslauf gerade starten.
     print(
@@ -366,23 +405,22 @@ def run_measurement(
     )
     
     warmup_start = time.perf_counter()                                                  # warmup_start startet die separat nicht ausgewertete Aufwaermphase.
+    warmup_display_latency_ms = 0.0                                                     # warmup_display_latency_ms zeigt die End-to-End-Latenz des vorherigen Aufwaermbildes an.
 
 
     # Die Aufwaermphase verarbeitet Bilder, damit Kamera und Detektor anlaufen.
     while True:
-        
+        frame_start = time.perf_counter()                                               # frame_start startet die End-to-End-Messung des Aufwaermbildes.
         frame, latency_ms, face_count = read_and_detect(camera, detector)               # read_and_detect verarbeitet das Aufwaermbild wie ein normales Kamerabild.
-        frame_height, frame_width = frame.shape[:2]                                     # frame_height und frame_width enthalten die tatsaechliche Bildgroesse.
-
-
         # Zeigt die Aufwaermphase an, die nicht in die Messwerte einfliesst.
         key = show_frame(
             frame,
             0.0,
-            latency_ms,
+            warmup_display_latency_ms,
             face_count,
             f"Aufwaermen {requested_width}x{requested_height}",
         )
+        warmup_display_latency_ms = (time.perf_counter() - frame_start) * 1000          # Erfasst Kamera, Erkennung, Zeichnen und Fensteraktualisierung.
 
 
         # q oder Esc bricht den gesamten Benchmark vor dem Bericht ab.
@@ -395,10 +433,12 @@ def run_measurement(
             break
 
 
-    print(f"Tatsaechliche Aufloesung: {frame_width}x{frame_height}")                    # Meldet die vom Kamerabild bestaetigte Groesse und nicht nur die Anforderung.
     latencies: list[float] = []                                                         # latencies sammelt die Latenz jedes Bildes innerhalb der Messdauer.
     
     frames = 0                                                                          # frames zaehlt die Bilder, die innerhalb des Messlaufs verarbeitet wurden.
+    actual_width: int | None = None                                                     # actual_width wird aus dem ersten gewerteten Messbild ermittelt.
+    actual_height: int | None = None                                                    # actual_height wird aus dem ersten gewerteten Messbild ermittelt.
+    display_latency_ms = 0.0                                                            # display_latency_ms zeigt die End-to-End-Latenz des vorherigen Messbildes an.
     measurement_start = time.perf_counter()                                             # measurement_start startet die Wandzeitmessung nach der Aufwaermphase.
     measurement_end = measurement_start                                                 # measurement_end dient zur Pruefung, ob die eingestellte Dauer erreicht ist.
 
@@ -406,21 +446,36 @@ def run_measurement(
     # Die Messschleife laeuft bis zur Dauer oder bis zum Abbruch durch q/Esc.
     while measurement_end - measurement_start < duration:
         
-        frame, latency_ms, face_count = read_and_detect(camera, detector)               # read_and_detect liefert das naechste Messbild samt Latenz und Gesichtszahl.
-        measurement_end = time.perf_counter()                                           # measurement_end aktualisiert die verstrichene Wandzeit.
+        frame_start = time.perf_counter()                                               # frame_start startet die End-to-End-Zeitmessung vor dem Kamera-Read.
+        frame, latency_ms, face_count = read_and_detect(camera, detector)               # read_and_detect liefert das Messbild samt Erkennungslatenz und Gesichtszahl.
+        frame_height, frame_width = frame.shape[:2]                                     # Die Bildgroesse wird direkt aus dem aktuellen Messbild gelesen.
+        # Die Ist-Aufloesung des ersten gewerteten Bildes wird im Ergebnis gespeichert.
+        if actual_width is None or actual_height is None:
+            actual_width = frame_width
+            actual_height = frame_height
+            print(f"Tatsaechliche Aufloesung im Messlauf: {actual_width}x{actual_height}")
+            # Eine abweichende Bildgroesse wird sichtbar gemeldet, aber weiter gemessen.
+            if (actual_width, actual_height) != (requested_width, requested_height):
+                print(
+                    f"Warnung: Angefordert waren {requested_width}x{requested_height}, "
+                    f"die Kamera liefert {actual_width}x{actual_height}."
+                )
         frames += 1                                                                     # Zaehlt das fertig verarbeitete Bild fuer die FPS-Berechnung.
-        latencies.append(latency_ms)                                                    # Speichert die Latenz fuer den Mittelwert dieses Messlaufs.
-        measured_fps = frames / (measurement_end - measurement_start)                   # measured_fps zeigt die laufende Durchschnittsrate waehrend des Tests.
+        measured_fps = frames / max(time.perf_counter() - measurement_start, 1e-9)      # measured_fps zeigt die laufende Durchschnittsrate waehrend des Tests.
         
 
         # Zeigt Messwerte und Fortschrittsstatus im Kamerafenster an.
         key = show_frame(
             frame,
             measured_fps,
-            latency_ms,
+            display_latency_ms,
             face_count,
             f"Messung {requested_width}x{requested_height}",
         )
+        measurement_end = time.perf_counter()                                           # measurement_end enthaelt auch Zeichnen und Fensteraktualisierung.
+        latency_ms = (measurement_end - frame_start) * 1000                             # Die Benchmark-Latenz umfasst die gesamte Verarbeitung bis zur Anzeige.
+        display_latency_ms = latency_ms                                                 # Der naechste Frame zeigt diese vollstaendige End-to-End-Latenz an.
+        latencies.append(latency_ms)                                                    # Speichert die End-to-End-Latenz fuer den Laufmittelwert.
 
         # q oder Esc bricht den gesamten Benchmark ab.
         if key == ord("q") or key == 27:
@@ -431,12 +486,16 @@ def run_measurement(
     average_latency = statistics.mean(latencies)                                        # average_latency ist der arithmetische Mittelwert aller Bildlatenzen.
     fps = frames / measured_duration                                                    # fps nutzt die Bildanzahl und die tatsaechliche Wandzeit.
 
+    # Ohne gewertetes Bild kann kein gueltiger Messwert zurueckgegeben werden.
+    if actual_width is None or actual_height is None:
+        raise RuntimeError("Der Messlauf hat kein Bild mit gueltiger Aufloesung geliefert.")
+
     # Gibt alle angeforderten und tatsaechlich gemessenen Laufwerte zurueck.
     return Measurement(
         requested_width=requested_width,
         requested_height=requested_height,
-        actual_width=frame_width,
-        actual_height=frame_height,
+        actual_width=actual_width,
+        actual_height=actual_height,
         fps=fps,
         latency_ms=average_latency,
         frames=frames,
@@ -460,8 +519,9 @@ def write_report(
         f"- Kamera-Index: {camera_index}",
         "- Laptop-/Kameramodell: bitte nach dem Test ergaenzen.",
         f"- Messdauer: {duration:g} Sekunden je Lauf, nach {warmup:g} Sekunden Aufwaermzeit.",
-        "- FPS: verarbeitete Bilder geteilt durch die tatsaechliche Messdauer.",
-        "- Latenz: mittlere Zeit pro Bild vom Start des Kamera-Reads bis zum Abschluss der MediaPipe-Erkennung.",
+        "- FPS: verarbeitete Bilder geteilt durch die tatsaechliche Messdauer einschliesslich Kamera-Read und Anzeige.",
+        "- Latenz: mittlere End-to-End-Zeit vom Start des Kamera-Reads bis zur OpenCV-Fensteraktualisierung, einschliesslich Erkennung, Zeichnen und Text-Overlay.",
+        "- Die tatsaechliche Bildschirmdarstellung kann durch das Betriebssystem oder Display-Backend zusaetzlich verzoegert sein.",
         "- Die angeforderte und die tatsaechlich gelieferte Kameraaufloesung werden je Lauf notiert.",
         "",
         "| Aufloesung (Soll) | Lauf 1: FPS / Latenz (Ist) | Lauf 2: FPS / Latenz (Ist) | Lauf 3: FPS / Latenz (Ist) | Mittel FPS | Mittel Latenz (ms) |",
@@ -498,6 +558,7 @@ def write_report(
             f"{run_cells[0]} | {run_cells[1]} | {run_cells[2]} | "
             f"{avg_fps:.2f} | {avg_latency:.2f} |"
         )
+
 
     # Fuegt eine Leerzeile und den Hinweis zum verwendeten Messmodus an.
     lines.extend(
@@ -537,11 +598,14 @@ def run_benchmark(
             f"{total_seconds / 60:.1f} Minuten."
         )
         
-        # Laeuft nacheinander ueber alle drei geforderten Kameraaufloesungen.
-        for requested_width, requested_height in RESOLUTIONS:
-            
-            # Wiederholt die Messung der aktuellen Aufloesung dreimal.
-            for run_number in range(1, MEASUREMENTS_PER_RESOLUTION + 1):
+        # Jede Aufloesung wird pro Runde in einer rotierten Reihenfolge gemessen.
+        for run_number in range(1, MEASUREMENTS_PER_RESOLUTION + 1):
+            # offset rotiert die Startposition, damit jede Aufloesung frueh, mittig und spaet drankommt.
+            for offset in range(len(RESOLUTIONS)):
+                # resolution_index waehlt die naechste Aufloesung der rotierten Reihenfolge.
+                resolution_index = (run_number - 1 + offset) % len(RESOLUTIONS)
+                # requested_width und requested_height sind die Einstellungen dieses Laufs.
+                requested_width, requested_height = RESOLUTIONS[resolution_index]
                 
                 # Fuehrt Aufwaermphase und den zeitlich begrenzten Messlauf aus.
                 measurement = run_measurement(
@@ -570,6 +634,11 @@ def run_benchmark(
                     f"{measurement.frames} Bilder in "
                     f"{measurement.duration_seconds:.2f} s."
                 )
+
+                # Latenzwerte dieser Auflösung ausgeben
+                print('\n',15*'==')
+                print_latenz(requested_width, requested_height, LATENZ)
+                print('', 15*'==','\n')
         
         # Erstellt den Bericht, wenn alle neun Messlaeufe abgeschlossen sind.
         write_report(measurements, args.camera, args.duration, args.warmup)
@@ -581,6 +650,18 @@ def run_benchmark(
         
         camera.release()                                                                # release gibt die Kameraverbindung frei.
         cv2.destroyAllWindows()                                                         # destroyAllWindows schliesst alle OpenCV-Fenster.
+
+
+
+
+# Gibt die gemessenen Latenzwerte einer Auflösung aus.
+def print_latenz(width: int, height: int, latenz: dict) -> None:
+
+    print(f"\n--- Latenz-Auswertung ({width}x{height}) ---")
+
+    for name, value in latenz.items():
+        print(f"{name:<10}: {value:.2f} ms")
+
 
 
 # main waehlt den normalen Kameramodus oder den automatischen Benchmark aus.
