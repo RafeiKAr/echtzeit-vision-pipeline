@@ -5,7 +5,7 @@
 <!-- AUTO:START (wird von `projekt.py readme` aktualisiert) -->
 | | |
 |---|---|
-| **Status** | 🚧 in progress (0 %) |
+| **Status** | ✅ finished |
 | **Goal** | ≥ 25 Bilder/s am Laptop bei 640×480, Tabelle mit 3 Bildgrößen in der README |
 | **Tech** | Python, OpenCV, MediaPipe, Laptop-Kamera oder USB-Webcam · Bonus: Raspberry Pi 5 |
 | **Focus** | Embedded Vision |
